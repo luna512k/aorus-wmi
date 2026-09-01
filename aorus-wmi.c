@@ -26,7 +26,6 @@
  * I/O ports.
  */
 
-#include <linux/acpi.h>
 #include <linux/build_bug.h>
 #include <linux/cleanup.h>
 #include <linux/dmi.h>
@@ -40,6 +39,7 @@
 #include <linux/slab.h>
 #include <linux/stddef.h>
 #include <linux/unaligned.h>
+#include <linux/version.h>
 #include <linux/wmi.h>
 
 #define DRIVER_NAME		"aorus-wmi"
@@ -78,7 +78,7 @@
  * argument, never inside this buffer. Word data at offset 4 (not 3) is
  * load-bearing: getting it wrong makes writes land on the wrong device
  * register while the firmware still reports success.
- * Full ABI: Documentation/wmi/gigabyte-wmi.rst
+ * Full ABI: Documentation/wmi/devices/aorus-wmi.rst
  *
  * Short buffers have been observed to break some function codes, so
  * always send at least AORUS_WMI_BUF_MIN bytes.
@@ -103,6 +103,19 @@ static_assert(offsetof(struct aorus_wmi_req_block, payload) == 7);
 #define AORUS_WMI_BLOCK_NAK	0x0004	/* block read: status DEV_ERR bit */
 
 /*
+ * Out-of-tree compatibility (dropped before upstream submission):
+ * kernels before 7.2 predate wmidev_invoke_method() and do not provide
+ * struct wmi_buffer; supply the minimal equivalent for the compat
+ * transport below.
+ */
+#if KERNEL_VERSION(7, 2, 0) > LINUX_VERSION_CODE
+struct wmi_buffer {
+	size_t length;
+	void *data;
+};
+#endif
+
+/*
  * Healthy transactions take ~1 ms; a hung bus costs the firmware up to
  * ~600 ms before it gives up and kills the transaction (three-tier cost
  * model: healthy/NAK ~0.5-1 ms, stale-status entry up to +200 ms, hung
@@ -118,6 +131,7 @@ struct aorus_wmi_adapter {
 	struct i2c_adapter adap;
 	struct aorus_wmi_data *data;
 	u8 bus;
+	u8 index;	/* adapter-relative bus number, for logging */
 };
 
 /*
@@ -143,7 +157,7 @@ struct aorus_wmi_data {
 	 * points to aorus_wmi_exec() in production.
 	 */
 	int (*exec)(struct aorus_wmi_data *priv, int fn, const u8 *in,
-		    size_t in_len, union acpi_object **result);
+		    size_t in_len, struct wmi_buffer *result);
 };
 
 /*
@@ -230,111 +244,125 @@ static int aorus_wmi_pack_request(u8 bus, u16 addr, int size, char read_write,
 	return fn;
 }
 
+#ifndef AORUS_WMI_KUNIT_TEST
+
+/* Minimum result-buffer length per function code, in bytes. */
+static size_t aorus_wmi_min_result_size(int fn)
+{
+	if (fn == AORUS_WMI_QUICK_READ || fn == AORUS_WMI_RECEIVE_BYTE)
+		return 2;
+	return 4;
+}
+
 /*
- * The real WMBB transport: one synchronous acpi_evaluate_object()
+ * The real WMBB transport: one synchronous WMI method invocation
  * performs ready-wait, transaction, completion poll and status clear.
  * There is no asynchronous completion; the call never times out early,
- * so a new transaction can never race the firmware.
+ * so a new transaction can never race the firmware. The WMI core
+ * unmarshals the ACPI result into a flat buffer of at least the
+ * requested minimum length (8-byte aligned, freed by the caller).
  *
  * This function is only compiled into the production driver: it
  * references the WMI core, which KUnit/UML builds intentionally do not
  * resolve - tests replace the transport via priv->exec instead.
+ *
+ * Out-of-tree compatibility section: kernels before 7.2 only provide
+ * the deprecated evaluate_method() API. This branch is dropped before
+ * upstream submission.
  */
-#ifndef AORUS_WMI_KUNIT_TEST
+#if KERNEL_VERSION(7, 2, 0) <= LINUX_VERSION_CODE
 static int aorus_wmi_exec(struct aorus_wmi_data *priv, int fn, const u8 *in,
-			  size_t in_len, union acpi_object **result)
+			  size_t in_len, struct wmi_buffer *result)
+{
+	const struct wmi_buffer in_buf = { .length = in_len, .data = (void *)in };
+
+	return wmidev_invoke_method(priv->wdev, 0, fn, &in_buf, result,
+				    aorus_wmi_min_result_size(fn));
+}
+#else /* pre-7.2: emulate the invoke_method() contract over evaluate_method() */
+static int aorus_wmi_exec(struct aorus_wmi_data *priv, int fn, const u8 *in,
+			  size_t in_len, struct wmi_buffer *result)
 {
 	struct acpi_buffer in_buf = { (acpi_size)in_len, (void *)in };
 	struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *obj;
 	acpi_status status;
+	int ret = 0;
+
+	status = wmidev_evaluate_method(priv->wdev, 0, fn, &in_buf, &out);
+	if (ACPI_FAILURE(status))
+		return -EIO;
 
 	/*
-	 * The WMI core evaluates WMBB(instance, fn, in): the function code
-	 * is passed as the method_id argument of the WMI API, and the bus
-	 * selector / transaction parameters as the input buffer.
+	 * Replicate the invoke_method() guarantees: buffer-typed result,
+	 * at least min_size bytes, linear data buffer owned by the caller.
 	 */
-	status = wmidev_evaluate_method(priv->wdev, 0, fn, &in_buf, &out);
-	if (ACPI_FAILURE(status)) {
-		dev_dbg(&priv->wdev->dev, "WMBB failed: %s\n",
-			acpi_format_exception(status));
+	obj = out.pointer;
+	if (!obj || obj->type != ACPI_TYPE_BUFFER ||
+	    (size_t)obj->buffer.length < aorus_wmi_min_result_size(fn)) {
+		kfree(obj);
 		return -EIO;
 	}
 
-	*result = out.pointer;
-	return 0;
-}
-#endif /* !AORUS_WMI_KUNIT_TEST */
+	result->length = obj->buffer.length;
+	result->data = kmemdup(obj->buffer.pointer, obj->buffer.length,
+			       GFP_KERNEL);
+	if (!result->data)
+		ret = -ENOMEM;
 
-/* Return the result payload of a WMBB call, or NULL if it is too short. */
-static const u8 *aorus_wmi_result(const union acpi_object *result,
-				  size_t min_len)
-{
-	if (!result || result->type != ACPI_TYPE_BUFFER ||
-	    result->buffer.length < min_len)
-		return NULL;
-	return result->buffer.pointer;
+	kfree(obj);
+	return ret;
 }
+#endif /* LINUX_VERSION_CODE */
+
+#endif /* !AORUS_WMI_KUNIT_TEST */
 
 /*
  * Parse a WMBB result buffer into Linux SMBus convention. Pure function:
  * no allocation, no I/O, and safe for every input - returned block
  * lengths are clamped both to I2C_SMBUS_BLOCK_MAX and to the actual
- * length of the firmware buffer.
+ * length of the result buffer. The WMI core guarantees the result
+ * buffer to hold at least the per-function minimum (see
+ * aorus_wmi_min_result_size()), so no additional length checks are
+ * needed here.
  */
 static s32 aorus_wmi_parse_result(int size, char read_write,
-				  const union acpi_object *result,
+				  const struct wmi_buffer *result,
 				  union i2c_smbus_data *data)
 {
-	const u8 *res;
-
 	if (read_write == I2C_SMBUS_WRITE) {
 		/* Write transactions report success as a dword 1. */
-		res = aorus_wmi_result(result, 4);
-		if (!res)
-			return -EIO;
-		return get_unaligned_le32(res) == AORUS_WMI_WRITE_OK ?
+		return get_unaligned_le32(result->data) == AORUS_WMI_WRITE_OK ?
 		       0 : -ENXIO;
 	}
 
 	switch (size) {
 	case I2C_SMBUS_QUICK:
 	case I2C_SMBUS_BYTE:
-		res = aorus_wmi_result(result, 2);
-		if (!res)
-			return -EIO;
-		if (get_unaligned_le16(res) == AORUS_WMI_BYTE_ERR)
+		if (get_unaligned_le16(result->data) == AORUS_WMI_BYTE_ERR)
 			return -ENXIO;
 		if (size == I2C_SMBUS_BYTE)
-			data->byte = get_unaligned_le16(res);
+			data->byte = get_unaligned_le16(result->data);
 		return 0;
 	case I2C_SMBUS_BYTE_DATA:
-		res = aorus_wmi_result(result, 4);
-		if (!res)
-			return -EIO;
-		if (get_unaligned_le32(res) == AORUS_WMI_BYTE_ERR)
+		if (get_unaligned_le32(result->data) == AORUS_WMI_BYTE_ERR)
 			return -ENXIO;
-		data->byte = get_unaligned_le32(res);
+		data->byte = get_unaligned_le32(result->data);
 		return 0;
 	case I2C_SMBUS_WORD_DATA:
-		res = aorus_wmi_result(result, 4);
-		if (!res)
-			return -EIO;
-		if (get_unaligned_le32(res) == AORUS_WMI_WORD_ERR)
+		if (get_unaligned_le32(result->data) == AORUS_WMI_WORD_ERR)
 			return -ENXIO;
-		data->word = get_unaligned_le32(res);
+		data->word = get_unaligned_le32(result->data);
 		return 0;
 	case I2C_SMBUS_BLOCK_DATA:
 		/* Result is a status word, a count word, then the data. */
-		res = aorus_wmi_result(result, 4);
-		if (!res)
-			return -EIO;
-		if (get_unaligned_le16(res) & AORUS_WMI_BLOCK_ERR)
-			return get_unaligned_le16(res) & AORUS_WMI_BLOCK_NAK ?
-			       -ENXIO : -EIO;
-		data->block[0] = min3((size_t)get_unaligned_le16(res + 2),
+		if (get_unaligned_le16(result->data) & AORUS_WMI_BLOCK_ERR)
+			return get_unaligned_le16(result->data) &
+			       AORUS_WMI_BLOCK_NAK ? -ENXIO : -EIO;
+		data->block[0] = min3((size_t)get_unaligned_le16(result->data + 2),
 				      (size_t)I2C_SMBUS_BLOCK_MAX,
-				      (size_t)(result->buffer.length - 4));
-		memcpy(&data->block[1], res + 4, data->block[0]);
+				      result->length - 4);
+		memcpy(&data->block[1], result->data + 4, data->block[0]);
 		return 0;
 	default:
 		return -EOPNOTSUPP;
@@ -348,7 +376,7 @@ static s32 aorus_wmi_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 {
 	struct aorus_wmi_adapter *a;
 	struct aorus_wmi_data *priv;
-	union acpi_object *result = NULL;
+	struct wmi_buffer result = { };
 	u8 buf[AORUS_WMI_BUF_MAX];
 	size_t in_len;
 	unsigned long start;
@@ -368,9 +396,18 @@ static s32 aorus_wmi_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 	ret = priv->exec(priv, fn, buf, in_len, &result);
 
 	/*
-	 * wmidev_evaluate_method() is synchronous: the AML always
-	 * completes (bounded by the timeout tiers) before returning. Never
-	 * return -ETIMEDOUT while the AML may still be executing - a new
+	 * The WMI core reports a missing result as -ENOMSG and a result
+	 * shorter than the per-function minimum as -ENODATA; both are
+	 * transport failures per the documented conventions (-EIO) and
+	 * must be normalized regardless of which transport impl ran.
+	 */
+	if (ret == -ENOMSG || ret == -ENODATA)
+		ret = -EIO;
+
+	/*
+	 * wmidev_invoke_method() is synchronous: the AML always completes
+	 * (bounded by the timeout tiers) before returning. Never return
+	 * -ETIMEDOUT while the AML may still be executing - a new
 	 * transaction could then start against a bus the firmware
 	 * considers busy. This warning therefore logs strictly after
 	 * completion and never races the firmware.
@@ -381,14 +418,14 @@ static s32 aorus_wmi_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 				     jiffies_to_msecs(jiffies - start));
 
 	if (!ret)
-		ret = aorus_wmi_parse_result(size, read_write, result, data);
+		ret = aorus_wmi_parse_result(size, read_write, &result, data);
 
 	dev_dbg(&priv->wdev->dev,
 		"bus %u addr 0x%02x size %d rw %d cmd 0x%02x fn 0x%02x -> %d (%ums)\n",
-		a->bus, addr, size, read_write, command, fn, ret,
+		a->index, addr, size, read_write, command, fn, ret,
 		jiffies_to_msecs(jiffies - start));
 
-	kfree(result);
+	kfree(result.data);
 	return ret;
 }
 
@@ -447,11 +484,12 @@ static void aorus_wmi_pci_dev_put(void *pdev)
 }
 
 static int aorus_wmi_add_adapter(struct aorus_wmi_data *priv,
-				 struct aorus_wmi_adapter *a, u8 bus,
+				 struct aorus_wmi_adapter *a, u8 index,
 				 const char *name)
 {
 	a->data = priv;
-	a->bus = bus;
+	a->bus = index == 0 ? AORUS_WMI_BUS0 : AORUS_WMI_BUS1;
+	a->index = index;
 
 	a->adap.owner = THIS_MODULE;
 	a->adap.algo = &aorus_wmi_algorithm;
@@ -509,11 +547,12 @@ static int aorus_wmi_probe(struct wmi_device *wdev, const void *context)
 		return ret;
 
 	/*
-	 * Registration performs no bus traffic: no device reads, no
-	 * device writes. Device discovery belongs to the normal client
-	 * drivers (ee1004, jc42, spd5118), which bind afterwards.
+	 * Registration performs no device writes; the client instantiation
+	 * below performs read-only discovery (SPD and temperature
+	 * probing). Devices are only ever written by explicit
+	 * userspace-initiated operations.
 	 */
-	ret = aorus_wmi_add_adapter(priv, &priv->bus0, AORUS_WMI_BUS0,
+	ret = aorus_wmi_add_adapter(priv, &priv->bus0, 0,
 				    "SMBus AORUS WMI adapter 0");
 	if (ret)
 		return ret;
@@ -521,7 +560,7 @@ static int aorus_wmi_probe(struct wmi_device *wdev, const void *context)
 	/* Instantiate SPD EEPROM and memory temperature sensor clients. */
 	i2c_register_spd_write_enable(&priv->bus0.adap);
 
-	return aorus_wmi_add_adapter(priv, &priv->bus1, AORUS_WMI_BUS1,
+	return aorus_wmi_add_adapter(priv, &priv->bus1, 1,
 				     "SMBus AORUS WMI adapter 1");
 }
 
@@ -542,7 +581,7 @@ static struct wmi_driver aorus_wmi_driver = {
 module_wmi_driver(aorus_wmi_driver);
 
 MODULE_AUTHOR("Luna Webster");
-MODULE_DESCRIPTION("WMI SMBus driver for Gigabyte motherboards: enables access to SMBus devices via the board firmware's WMI interface");
+MODULE_DESCRIPTION("WMI SMBus driver for Gigabyte motherboards");
 MODULE_LICENSE("GPL");
 
 #endif /* !AORUS_WMI_KUNIT_TEST */

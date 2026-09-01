@@ -18,8 +18,10 @@ The driver is a general SMBus transport, not a device driver for any
 particular peripheral: everything attached to those buses becomes
 reachable through the standard i2c subsystem. On the reference platform
 this enables RGB memory control via OpenRGB and memory temperature/SPD
-support via the in-kernel ``jc42``, ``spd5118`` and ``ee1004`` clients,
-which bind on their own once the adapters are registered.
+support via the in-kernel SPD clients: ``ee1004`` (DDR4 SPD EEPROMs)
+binds on the memory bus, and the ``ee1004`` client itself instantiates
+the ``jc42`` temperature sensors found on DDR3/DDR4 modules.
+``spd5118`` (DDR5 modules) binds on DDR5 boards and is inert on DDR4.
 
 No kernel command-line options or ACPI resource-check workarounds (such
 as ``acpi_enforce_resources=lax``) are required: the driver requests no
@@ -46,7 +48,8 @@ SMBus interface). The driver therefore binds automatically only to
 boards in its DMI allowlist, which lists boards on which the wire ABI
 below has been verified:
 
-* Gigabyte X570 AORUS XTREME (rev 1.0)
+* Gigabyte X570 AORUS XTREME (the board version string is not
+  populated by the firmware, so revisions cannot be distinguished)
 
 An unlisted board can be tried with ``aorus_wmi.force=1``; registration
 then performs no bus traffic either way, and device discovery is left to
@@ -69,8 +72,11 @@ via ``wmidev_evaluate_method()``: the function code travels as the WMI
 The argument buffer selects the bus and carries the transaction
 parameters.
 
-Function codes implemented by the firmware (observed from the decompiled
-AML):
+The WMBB dispatch implements several unrelated function families (board
+information, sleep/wake notifications, raw I/O, PCI configuration and
+physical memory access as a service). This driver implements only the
+SMBus transaction set; everything else is intentionally not exposed.
+The SMBus function codes (observed from the decompiled AML):
 
 ===================  =========================================
 ``0x62`` / ``0x63``  Quick write / quick read (bus 0 only)
@@ -117,7 +123,8 @@ result is a transport failure and maps to ``-EIO``.
   write): a dword that is ``1`` on success and ``0`` on failure
   (mapped to ``-ENXIO``).
 * **Byte-data read** (``0x68``): dword value; ``0xFFFF`` means
-  failure/NAK (``-ENXIO``).
+  failure/NAK (``-ENXIO``). Known limitation: a device that legitimately
+  returns the data value ``0xFFFF`` is indistinguishable from a NAK.
 * **Word-data read** (``0x6A``): dword value; ``0xFFFFFFFF`` means
   failure/NAK (``-ENXIO``).
 * **Quick read** (``0x63``) / **receive byte** (``0x66``): word value;
@@ -214,6 +221,44 @@ slow-transaction logging happens strictly after completion (rate-limited
 warning above 50 ms, which makes tier-3 wedged-bus behaviour visible
 without noise from normal NAK probing).
 
+Device map and i2cdetect caveats
+================================
+
+Real devices observed on the reference platform (bus 0):
+
+======================  =============================================
+Address                 Device
+======================  =============================================
+``0x18``–``0x1B``       ``jc42`` DDR3/DDR4 module temperature sensors
+``0x36``/``0x37``       SPD page-select reservation (``ee1004``)
+``0x50``–``0x53``       ``ee1004`` DDR4 SPD EEPROMs
+``0x70``–``0x77``       ENE RGB memory controllers (address changes
+                        between boots; observed at 0x66, 0x70–0x74
+                        and 0x77 on different boots)
+======================  =============================================
+
+``i2cdetect`` scans return deterministic **false positives** on these
+adapters: some addresses ACK although no device is present, because the
+host controller or the firmware path acknowledges the transaction.
+
+* quick-write scan reports: ``0x10, 0x13, 0x15, 0x3A, 0x4A, 0x68,
+  0x6C, 0x70–0x74, 0x78, 0x7A, 0x7C, 0x7E``
+* receive-byte scan adds: ``0x08, 0x30–0x35``
+* bus 1 (no real devices on the reference board): ``0x4F, 0x51, 0x6A``
+
+Treat scan results as a starting point and confirm devices by reading
+their identity registers. Do not use bus 1 for detection: the firmware
+stubs the quick and receive-byte transactions there.
+
+Removal semantics
+=================
+
+Module removal (``modprobe -r``, unbind, or a DKMS upgrade) blocks for
+as long as any ``/dev/i2c-N`` file descriptor for these adapters is
+open — standard i2c-core behaviour. Close OpenRGB (in particular: its
+autostart instance holds the descriptors indefinitely) before removing
+or upgrading the driver.
+
 Hardware topology
 =================
 
@@ -230,7 +275,8 @@ consequence, userspace DRAM tooling (e.g. OpenRGB) discovers
 DRAM-capable SMBus buses by the PCI ID of the adapter's sysfs parent,
 and memory SPD/temperature client instantiation
 (``i2c_register_spd_write_enable()``) then finds the modules: ``ee1004``
-SPD EEPROMs, ``jc42`` and ``spd5118`` temperature sensors.
+SPD EEPROMs — and the ``ee1004`` client in turn instantiates the
+``jc42`` temperature sensors. ``spd5118`` covers DDR5 boards.
 
 Why WMI rather than native i2c-piix4
 ====================================
@@ -259,3 +305,37 @@ consumers that are not visible to the OS.
 The WMI path dissolves rather than suppresses the resource question: the
 driver claims no I/O resources, so no ``acpi_enforce_resources``
 conflict can arise, and no kernel command-line workaround is needed.
+
+Relationship to the gigabyte-wmi driver
+=======================================
+
+The in-tree ``gigabyte-wmi`` driver (``drivers/platform/x86/``) binds to
+a sibling GUID of the same ``_WDG`` family and serves temperature
+monitoring on some Gigabyte boards. The two drivers expose disjoint ABI
+surfaces (hwmon attributes vs i2c adapters) and do not co-occur on
+currently known boards, but both match firmware objects that may exist
+side by side, so their coexistence is designed explicitly:
+
+=============================================  ==================================================
+Scenario                                       Outcome
+=============================================  ==================================================
+aorus-wmi on a DMI-listed board                aorus-wmi binds; the sibling GUID family member
+                                               used by ``gigabyte-wmi`` is not present there
+gigabyte-wmi probes first on a listed board    it binds, fails with ``-ENODEV`` (its WQAA data
+                                               block is absent), and **releases the device**;
+                                               aorus-wmi's registration re-probes and binds
+aorus-wmi probes first on a non-listed board   aorus-wmi refuses (DMI boundary); gigabyte-wmi
+                                               serves temperature monitoring
+board with both ABI families                   winner-takes-all — none known; covered by the
+                                               coordination change below
+=============================================  ==================================================
+
+The failed-probe release behaviour was verified experimentally
+(gigabyte-wmi bind-fail-release, followed by a successful aorus-wmi
+bind and full client-chain recovery). Recovery relies on the later
+driver's registration re-probing unbound devices — not on polling. A
+small coordination change for ``gigabyte-wmi`` (yield its probe on
+boards where the GSA1 SMBus driver owns the device) converts the
+load-order race into a deterministic contract and accompanies the
+upstream submission of this driver.
+

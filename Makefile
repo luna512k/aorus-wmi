@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: GPL-2.0-only
 obj-m += aorus-wmi.o
 
 # KUnit suite: builds only on kernels with KUnit support enabled.

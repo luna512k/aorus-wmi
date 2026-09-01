@@ -5,9 +5,18 @@
  * These tests run without hardware: the WMI transport is replaced by a
  * fake firmware, and the request marshalling and result parsing are
  * asserted byte-exact against the ABI documented in
- * Documentation/wmi/gigabyte-wmi.rst. In particular the word-data
+ * Documentation/wmi/devices/aorus-wmi.rst. In particular the word-data
  * offset-4 layout is pinned here - moving any request field must fail
  * these tests immediately.
+ *
+ * Running the suite:
+ *
+ *   - in-tree: ./tools/testing/kunit/kunit.py run --kunitconfig <path>/kunitconfig
+ *     aorus-wmi (with this driver's Kconfig fragment)
+ *   - out-of-tree on a CONFIG_KUNIT kernel: make && sudo modprobe aorus-wmi-test;
+ *     results appear in the kernel log (ktap)
+ *
+ * The kunitconfig in the repository root lists the required options.
  */
 
 #include <kunit/test.h>
@@ -17,12 +26,13 @@
 /*
  * Fake firmware. The transport operation in the driver-under-test is
  * pointed at fake_exec(); results are handed over one at a time and
- * ownership of each result object transfers to smbus_xfer(), which
+ * ownership of each result buffer transfers to smbus_xfer(), which
  * frees it.
  */
 static struct {
 	int fail;			/* error to return from exec */
-	union acpi_object *next;	/* kmalloc'd result, ownership transferred */
+	u8 *next_data;			/* kmalloc'd result, ownership transferred */
+	size_t next_len;
 	int calls;			/* number of exec invocations */
 	int last_fn;
 	size_t last_len;
@@ -36,7 +46,7 @@ struct aorus_wmi_test_env {
 };
 
 static int fake_exec(struct aorus_wmi_data *priv, int fn, const u8 *in,
-		     size_t in_len, union acpi_object **result)
+		     size_t in_len, struct wmi_buffer *result)
 {
 	fake.calls++;
 	fake.last_fn = fn;
@@ -47,35 +57,43 @@ static int fake_exec(struct aorus_wmi_data *priv, int fn, const u8 *in,
 	if (fake.fail)
 		return fake.fail;
 
-	*result = fake.next;
-	fake.next = NULL;
+	result->length = fake.next_len;
+	result->data = fake.next_data;
+	fake.next_data = NULL;
+	fake.next_len = 0;
 	return 0;
 }
 
-/* Queue a firmware buffer result; ownership passes to smbus_xfer(). */
+/* Queue a firmware result buffer; ownership passes to smbus_xfer(). */
 static void fake_set_result(struct kunit *test, const u8 *bytes, size_t len)
 {
-	union acpi_object *obj;
+	u8 *data;
 
-	obj = kmalloc(sizeof(*obj) + len, GFP_KERNEL);
-	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, obj);
-	memset(obj, 0, sizeof(*obj) + len);
-	obj->type = ACPI_TYPE_BUFFER;
-	obj->buffer.length = len;
-	obj->buffer.pointer = (u8 *)(obj + 1);
-	memcpy(obj->buffer.pointer, bytes, len);
+	data = kmalloc(len, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, data);
+	memcpy(data, bytes, len);
 
-	fake.next = obj;
+	fake.next_data = data;
+	fake.next_len = len;
+}
+
+static void aorus_wmi_test_mutex_destroy(void *lock)
+{
+	mutex_destroy(lock);
 }
 
 static struct aorus_wmi_test_env *env_init(struct kunit *test, u8 bus)
 {
 	struct aorus_wmi_test_env *env;
+	int ret;
 
 	env = kunit_kzalloc(test, sizeof(*env), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, env);
 
 	mutex_init(&env->priv.lock);
+	ret = kunit_add_action(test, aorus_wmi_test_mutex_destroy,
+			       &env->priv.lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
 	env->priv.wdev = kunit_kzalloc(test, sizeof(struct wmi_device),
 				       GFP_KERNEL);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, env->priv.wdev);
@@ -83,8 +101,10 @@ static struct aorus_wmi_test_env *env_init(struct kunit *test, u8 bus)
 
 	env->ad0.data = &env->priv;
 	env->ad0.bus = AORUS_WMI_BUS0;
+	env->ad0.index = 0;
 	env->ad1.data = &env->priv;
 	env->ad1.bus = AORUS_WMI_BUS1;
+	env->ad1.index = 1;
 
 	return env;
 }
@@ -298,160 +318,138 @@ static void aorus_wmi_pack_unknown_size(struct kunit *test)
 
 static void aorus_wmi_parse_write(struct kunit *test)
 {
-	union acpi_object obj;
 	union i2c_smbus_data data;
 	const u8 ok[] = { 0x01, 0x00, 0x00, 0x00 };
 	const u8 fail[] = { 0x00, 0x00, 0x00, 0x00 };
+	struct wmi_buffer result = { .length = sizeof(ok),
+				     .data = (u8 *)ok };
 	int ret;
 
-	obj.type = ACPI_TYPE_BUFFER;
-	obj.buffer.length = sizeof(ok);
-	obj.buffer.pointer = (u8 *)ok;
-
 	ret = aorus_wmi_parse_result(I2C_SMBUS_BYTE_DATA, I2C_SMBUS_WRITE,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 
 	ret = aorus_wmi_parse_result(I2C_SMBUS_WORD_DATA, I2C_SMBUS_WRITE,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 
-	obj.buffer.pointer = (u8 *)fail;
+	result.data = (u8 *)fail;
 	ret = aorus_wmi_parse_result(I2C_SMBUS_BYTE_DATA, I2C_SMBUS_WRITE,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, -ENXIO);
 }
 
 static void aorus_wmi_parse_byte_read(struct kunit *test)
 {
-	union acpi_object obj;
 	union i2c_smbus_data data;
 	const u8 ok[] = { 0x23, 0x00, 0x00, 0x00 };
 	const u8 nak[] = { 0xff, 0xff, 0x00, 0x00 };
+	struct wmi_buffer result = { .length = sizeof(ok),
+				     .data = (u8 *)ok };
 	int ret;
 
-	obj.type = ACPI_TYPE_BUFFER;
-	obj.buffer.length = sizeof(ok);
-	obj.buffer.pointer = (u8 *)ok;
-
 	ret = aorus_wmi_parse_result(I2C_SMBUS_BYTE_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, data.byte, 0x23);
 
-	obj.buffer.pointer = (u8 *)nak;
+	result.data = (u8 *)nak;
 	ret = aorus_wmi_parse_result(I2C_SMBUS_BYTE_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, -ENXIO);
 }
 
 static void aorus_wmi_parse_word_read(struct kunit *test)
 {
-	union acpi_object obj;
 	union i2c_smbus_data data;
 	const u8 ok[] = { 0xcd, 0xab, 0x00, 0x00 };
 	const u8 nak[] = { 0xff, 0xff, 0xff, 0xff };
+	struct wmi_buffer result = { .length = sizeof(ok),
+				     .data = (u8 *)ok };
 	int ret;
 
-	obj.type = ACPI_TYPE_BUFFER;
-	obj.buffer.length = sizeof(ok);
-	obj.buffer.pointer = (u8 *)ok;
-
 	ret = aorus_wmi_parse_result(I2C_SMBUS_WORD_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, data.word, 0xabcd);
 
-	obj.buffer.pointer = (u8 *)nak;
+	result.data = (u8 *)nak;
 	ret = aorus_wmi_parse_result(I2C_SMBUS_WORD_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, -ENXIO);
 }
 
 static void aorus_wmi_parse_quick_read(struct kunit *test)
 {
-	union acpi_object obj;
 	union i2c_smbus_data data;
 	const u8 ok[] = { 0x34, 0x12 };
 	const u8 nak[] = { 0xff, 0xff };
+	struct wmi_buffer result = { .length = sizeof(ok),
+				     .data = (u8 *)ok };
 	int ret;
 
-	obj.type = ACPI_TYPE_BUFFER;
-	obj.buffer.length = sizeof(ok);
-	obj.buffer.pointer = (u8 *)ok;
-
 	ret = aorus_wmi_parse_result(I2C_SMBUS_QUICK, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 
-	obj.buffer.pointer = (u8 *)nak;
+	result.data = (u8 *)nak;
 	ret = aorus_wmi_parse_result(I2C_SMBUS_QUICK, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, -ENXIO);
 }
 
 static void aorus_wmi_parse_receive_byte(struct kunit *test)
 {
-	union acpi_object obj;
 	union i2c_smbus_data data;
 	const u8 val[] = { 0x5a, 0x00 };
+	struct wmi_buffer result = { .length = sizeof(val),
+				     .data = (u8 *)val };
 	int ret;
 
-	obj.type = ACPI_TYPE_BUFFER;
-	obj.buffer.length = sizeof(val);
-	obj.buffer.pointer = (u8 *)val;
-
 	ret = aorus_wmi_parse_result(I2C_SMBUS_BYTE, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, data.byte, 0x5a);
 }
 
 static void aorus_wmi_parse_block_read(struct kunit *test)
 {
-	union acpi_object obj;
 	union i2c_smbus_data data;
 	/* status word, count word, three data bytes */
 	const u8 ok[] = { 0x00, 0x00, 0x03, 0x00, 0xaa, 0xbb, 0xcc };
 	const u8 nak[] = { 0x04, 0x80, 0x00, 0x00 };
 	const u8 err[] = { 0x01, 0x80, 0x00, 0x00 };
+	struct wmi_buffer result = { .length = sizeof(ok),
+				     .data = (u8 *)ok };
 	int ret;
 
-	obj.type = ACPI_TYPE_BUFFER;
-	obj.buffer.length = sizeof(ok);
-	obj.buffer.pointer = (u8 *)ok;
-
 	ret = aorus_wmi_parse_result(I2C_SMBUS_BLOCK_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, data.block[0], 3);
 	KUNIT_EXPECT_EQ(test, data.block[1], 0xaa);
 	KUNIT_EXPECT_EQ(test, data.block[2], 0xbb);
 	KUNIT_EXPECT_EQ(test, data.block[3], 0xcc);
 
-	obj.buffer.pointer = (u8 *)nak;	/* bit15 + DEV_ERR */
+	result.data = (u8 *)nak;	/* bit15 + DEV_ERR */
 	ret = aorus_wmi_parse_result(I2C_SMBUS_BLOCK_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, -ENXIO);
 
-	obj.buffer.pointer = (u8 *)err;	/* bit15 without DEV_ERR */
+	result.data = (u8 *)err;	/* bit15 without DEV_ERR */
 	ret = aorus_wmi_parse_result(I2C_SMBUS_BLOCK_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, -EIO);
 }
 
 static void aorus_wmi_parse_block_count_clamps(struct kunit *test)
 {
-	union acpi_object obj;
 	union i2c_smbus_data data;
 	u8 buf[4 + I2C_SMBUS_BLOCK_MAX];
+	struct wmi_buffer result = { .length = sizeof(buf), .data = buf };
 	int ret, i;
 
-	obj.type = ACPI_TYPE_BUFFER;
-
 	/* Firmware claims 255 bytes but only sends 32: clamp to 32. */
-	obj.buffer.length = sizeof(buf);
-	obj.buffer.pointer = buf;
 	buf[0] = 0x00;
 	buf[1] = 0x00;
 	buf[2] = 0xff;
@@ -460,67 +458,58 @@ static void aorus_wmi_parse_block_count_clamps(struct kunit *test)
 		buf[4 + i] = i;
 
 	ret = aorus_wmi_parse_result(I2C_SMBUS_BLOCK_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, data.block[0], I2C_SMBUS_BLOCK_MAX);
 
 	/* Firmware sends fewer bytes than it claims: clamp to the buffer. */
-	obj.buffer.length = 4 + 5;
+	result.length = 4 + 5;
 	buf[2] = 10;
 	ret = aorus_wmi_parse_result(I2C_SMBUS_BLOCK_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, data.block[0], 5);
 
 	/* Zero-length block is valid. */
-	obj.buffer.length = 4;
+	result.length = 4;
 	buf[2] = 0;
 	ret = aorus_wmi_parse_result(I2C_SMBUS_BLOCK_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
+				     &result, &data);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, data.block[0], 0);
 }
 
-static void aorus_wmi_parse_malformed(struct kunit *test)
+/*
+ * Short and missing results cannot reach parse_result() - the WMI core
+ * enforces the per-function minimum length (-ENODATA) and reports a
+ * missing result with -ENOMSG. The driver must normalize both to -EIO.
+ */
+static void aorus_wmi_fault_short_results(struct kunit *test)
 {
-	union acpi_object obj;
-	union i2c_smbus_data data;
-	const u8 one[] = { 0x23 };
-	const u8 two[] = { 0x23, 0x00 };
+	struct aorus_wmi_test_env *env = env_init(test, AORUS_WMI_BUS0);
+	union i2c_smbus_data data = { .byte = 0x55 };
 	int ret;
 
-	/* NULL result object. */
-	ret = aorus_wmi_parse_result(I2C_SMBUS_BYTE_DATA, I2C_SMBUS_READ,
-				     NULL, &data);
+	fake.fail = -ENOMSG;
+	ret = aorus_wmi_smbus_xfer(&env->ad0.adap, 0x50, 0, I2C_SMBUS_WRITE,
+				   0xaa, I2C_SMBUS_BYTE_DATA, &data);
 	KUNIT_EXPECT_EQ(test, ret, -EIO);
 
-	/* Wrong ACPI object type. */
-	obj.type = ACPI_TYPE_INTEGER;
-	obj.integer.value = 0x23;
-	ret = aorus_wmi_parse_result(I2C_SMBUS_BYTE_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
+	fake.fail = -ENODATA;
+	ret = aorus_wmi_smbus_xfer(&env->ad0.adap, 0x50, 0, I2C_SMBUS_WRITE,
+				   0xaa, I2C_SMBUS_BYTE_DATA, &data);
 	KUNIT_EXPECT_EQ(test, ret, -EIO);
 
-	/* Zero-length buffer. */
-	obj.type = ACPI_TYPE_BUFFER;
-	obj.buffer.length = 0;
-	obj.buffer.pointer = NULL;
-	ret = aorus_wmi_parse_result(I2C_SMBUS_BYTE_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
-	KUNIT_EXPECT_EQ(test, ret, -EIO);
+	fake.fail = -ENODEV;	/* unexpected core errors pass through */
+	ret = aorus_wmi_smbus_xfer(&env->ad0.adap, 0x50, 0, I2C_SMBUS_WRITE,
+				   0xaa, I2C_SMBUS_BYTE_DATA, &data);
+	KUNIT_EXPECT_EQ(test, ret, -ENODEV);
+	fake.fail = 0;
 
-	/* Buffer shorter than the minimum for the transaction type. */
-	obj.buffer.length = sizeof(one);
-	obj.buffer.pointer = (u8 *)one;
-	ret = aorus_wmi_parse_result(I2C_SMBUS_BYTE_DATA, I2C_SMBUS_READ,
-				     &obj, &data);
-	KUNIT_EXPECT_EQ(test, ret, -EIO);
-
-	/* Quick read needs only two bytes: this buffer is sufficient. */
-	obj.buffer.length = sizeof(two);
-	obj.buffer.pointer = (u8 *)two;
-	ret = aorus_wmi_parse_result(I2C_SMBUS_QUICK, I2C_SMBUS_READ,
-				     &obj, &data);
+	/* The adapter must remain usable after the failures. */
+	fake_set_result(test, (const u8[]){ 0x01, 0x00, 0x00, 0x00 }, 4);
+	ret = aorus_wmi_smbus_xfer(&env->ad0.adap, 0x50, 0, I2C_SMBUS_WRITE,
+				   0xaa, I2C_SMBUS_BYTE_DATA, &data);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 }
 
@@ -632,40 +621,6 @@ static void aorus_wmi_fault_wmi_failure(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ret, 0);
 }
 
-static void aorus_wmi_fault_bad_results(struct kunit *test)
-{
-	struct aorus_wmi_test_env *env = env_init(test, AORUS_WMI_BUS0);
-	union i2c_smbus_data data;
-	union acpi_object *obj;
-	int ret;
-
-	/* exec succeeds but returns no result object. */
-	ret = aorus_wmi_smbus_xfer(&env->ad0.adap, 0x50, 0, I2C_SMBUS_READ,
-				   0x00, I2C_SMBUS_BYTE_DATA, &data);
-	KUNIT_EXPECT_EQ(test, ret, -EIO);
-
-	/* exec returns a non-buffer ACPI object (heap: smbus_xfer frees it). */
-	obj = kmalloc_obj(*obj, GFP_KERNEL);
-	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, obj);
-	memset(obj, 0, sizeof(*obj));
-	obj->type = ACPI_TYPE_INTEGER;
-	obj->integer.value = 0x23;
-	fake.next = obj;
-	ret = aorus_wmi_smbus_xfer(&env->ad0.adap, 0x50, 0, I2C_SMBUS_READ,
-				   0x00, I2C_SMBUS_BYTE_DATA, &data);
-	KUNIT_EXPECT_EQ(test, ret, -EIO);
-
-	/* The wrong-type result was consumed and freed by smbus_xfer(). */
-	KUNIT_EXPECT_FALSE(test, fake.next);
-
-	/* The adapter must remain usable afterwards. */
-	fake_set_result(test, (const u8[]){ 0x23, 0x00, 0x00, 0x00 }, 4);
-	ret = aorus_wmi_smbus_xfer(&env->ad0.adap, 0x50, 0, I2C_SMBUS_READ,
-				   0x00, I2C_SMBUS_BYTE_DATA, &data);
-	KUNIT_EXPECT_EQ(test, ret, 0);
-	KUNIT_EXPECT_EQ(test, data.byte, 0x23);
-}
-
 static int aorus_wmi_test_init(struct kunit *test)
 {
 	memset(&fake, 0, sizeof(fake));
@@ -675,7 +630,7 @@ static int aorus_wmi_test_init(struct kunit *test)
 static void aorus_wmi_test_exit(struct kunit *test)
 {
 	/* Free any result the fake queued but smbus_xfer never consumed. */
-	kfree(fake.next);
+	kfree(fake.next_data);
 	memset(&fake, 0, sizeof(fake));
 }
 
@@ -697,12 +652,11 @@ static struct kunit_case aorus_wmi_test_cases[] = {
 	KUNIT_CASE(aorus_wmi_parse_receive_byte),
 	KUNIT_CASE(aorus_wmi_parse_block_read),
 	KUNIT_CASE(aorus_wmi_parse_block_count_clamps),
-	KUNIT_CASE(aorus_wmi_parse_malformed),
+	KUNIT_CASE(aorus_wmi_fault_short_results),
 	KUNIT_CASE(aorus_wmi_xfer_bus0_matrix),
 	KUNIT_CASE(aorus_wmi_xfer_bus1_matrix),
 	KUNIT_CASE(aorus_wmi_xfer_unknown_size),
 	KUNIT_CASE(aorus_wmi_fault_wmi_failure),
-	KUNIT_CASE(aorus_wmi_fault_bad_results),
 	{ }
 };
 
