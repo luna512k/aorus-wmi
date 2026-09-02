@@ -288,8 +288,8 @@ static int aorus_wmi_exec(struct aorus_wmi_data *priv, int fn, size_t min_size,
 				    min_size);
 }
 #else /* pre-7.2: emulate the invoke_method() contract over evaluate_method() */
-static int aorus_wmi_exec(struct aorus_wmi_data *priv, int fn, const u8 *in,
-			  size_t in_len, struct wmi_buffer *result)
+static int aorus_wmi_exec(struct aorus_wmi_data *priv, int fn, size_t min_size,
+			  const u8 *in, size_t in_len, struct wmi_buffer *result)
 {
 	struct acpi_buffer in_buf = { (acpi_size)in_len, (void *)in };
 	struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
@@ -307,7 +307,7 @@ static int aorus_wmi_exec(struct aorus_wmi_data *priv, int fn, const u8 *in,
 	 */
 	obj = out.pointer;
 	if (!obj || obj->type != ACPI_TYPE_BUFFER ||
-	    (size_t)obj->buffer.length < aorus_wmi_min_result_size(fn)) {
+	    (size_t)obj->buffer.length < min_size) {
 		kfree(obj);
 		return -EIO;
 	}
