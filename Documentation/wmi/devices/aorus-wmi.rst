@@ -116,8 +116,12 @@ wrong device register while the firmware still reports success.
 Response format
 ===============
 
-All functions return an ACPI buffer; a missing, empty or wrong-typed
-result is a transport failure and maps to ``-EIO``.
+All functions return their result through the WMI core, which unmarshals
+the ACPI object into a linear byte buffer of at least the per-function
+minimum length (see the transaction table above). A missing result, or
+one shorter than that minimum, is a transport failure and maps to
+``-EIO``. The core coerces non-buffer results (e.g. integers) to 4-byte
+buffers, so a differently-typed result is not a failure.
 
 * **Write transactions** (quick write, send byte, byte/word/block
   write): a dword that is ``1`` on success and ``0`` on failure
@@ -250,14 +254,21 @@ Treat scan results as a starting point and confirm devices by reading
 their identity registers. Do not use bus 1 for detection: the firmware
 stubs the quick and receive-byte transactions there.
 
-Removal semantics
+Known limitations
 =================
 
-Module removal (``modprobe -r``, unbind, or a DKMS upgrade) blocks for
-as long as any ``/dev/i2c-N`` file descriptor for these adapters is
-open — standard i2c-core behaviour. Close OpenRGB (in particular: its
-autostart instance holds the descriptors indefinitely) before removing
-or upgrading the driver.
+* **Sentinel collision (0xFFFF).** A byte-data read that legitimately
+  returns the data value ``0xFFFF`` is indistinguishable from a NAK —
+  both map to ``-ENXIO`` (see the response-format conventions above).
+* **Scan false positives.** ``i2cdetect`` scans report deterministic
+  ACKs for addresses with no device behind them (host/firmware
+  artifacts); see the device map above for the per-scan address lists.
+  Confirm devices by reading their identity registers.
+* **Removal blocks on open descriptors.** Module removal (``modprobe
+  -r``, unbind, or a DKMS upgrade) waits for any open ``/dev/i2c-N``
+  file descriptor — standard i2c-core behaviour. Close OpenRGB (its
+  autostart instance holds the descriptors indefinitely) before
+  removing or upgrading the driver.
 
 Hardware topology
 =================
@@ -310,23 +321,27 @@ Relationship to the gigabyte-wmi driver
 =======================================
 
 The in-tree ``gigabyte-wmi`` driver (``drivers/platform/x86/``) binds to
-a sibling GUID of the same ``_WDG`` family and serves temperature
-monitoring on some Gigabyte boards. The two drivers expose disjoint ABI
-surfaces (hwmon attributes vs i2c adapters) and do not co-occur on
-currently known boards, but both match firmware objects that may exist
-side by side, so their coexistence is designed explicitly:
+the **same WMI GUID** as this driver
+(``DEADBEEF-2001-0000-00A0-C90629100000`` — the ``WMBB`` method), so on
+any board where the device is present, only one of the two drivers can
+own it at a time. The drivers expose disjoint ABI surfaces (hwmon
+attributes vs i2c adapters) and their firmware features do not co-occur
+on currently known boards, but the GUID collision makes their
+coexistence explicit design rather than accident:
 
 =============================================  ==================================================
 Scenario                                       Outcome
 =============================================  ==================================================
-aorus-wmi on a DMI-listed board                aorus-wmi binds; the sibling GUID family member
-                                               used by ``gigabyte-wmi`` is not present there
-gigabyte-wmi probes first on a listed board    it binds, fails with ``-ENODEV`` (its WQAA data
-                                               block is absent), and **releases the device**;
+aorus-wmi on a DMI-listed board                aorus-wmi binds the device (the WMI device is
+                                               present — that is what aorus-wmi matches)
+gigabyte-wmi probes first on a listed board    it binds, issues its temperature query (WMBB
+                                               function ``0x125``), fails with ``-ENODEV``
+                                               because this firmware's dispatch has no
+                                               ``0x125`` branch, and **releases the device**;
                                                aorus-wmi's registration re-probes and binds
 aorus-wmi probes first on a non-listed board   aorus-wmi refuses (DMI boundary); gigabyte-wmi
-                                               serves temperature monitoring
-board with both ABI families                   winner-takes-all — none known; covered by the
+                                               binds and serves temperature monitoring
+board with both dispatch branches              winner-takes-all — none known; covered by the
                                                coordination change below
 =============================================  ==================================================
 

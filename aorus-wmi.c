@@ -156,8 +156,8 @@ struct aorus_wmi_data {
 	 * Firmware transport, injectable for KUnit testing. Always
 	 * points to aorus_wmi_exec() in production.
 	 */
-	int (*exec)(struct aorus_wmi_data *priv, int fn, const u8 *in,
-		    size_t in_len, struct wmi_buffer *result);
+	int (*exec)(struct aorus_wmi_data *priv, int fn, size_t min_size,
+		    const u8 *in, size_t in_len, struct wmi_buffer *result);
 };
 
 /*
@@ -193,7 +193,11 @@ static int aorus_wmi_pack_request(u8 bus, u16 addr, int size, char read_write,
 	memset(buf, 0, AORUS_WMI_BUF_MAX);
 	*in_len = AORUS_WMI_BUF_MIN;
 
-	/* The AML sets the read bit itself; the caller passes addr << 1. */
+	/*
+	 * The AML sets the read bit itself; the caller passes addr << 1.
+	 * The i2c-core SMBus contract guarantees addr <= 0x7F, which makes
+	 * the truncation to the u8 wire byte safe.
+	 */
 	req->byte.bus = bus;
 	req->byte.addr = addr << 1;
 	req->byte.cmd = command;
@@ -244,15 +248,19 @@ static int aorus_wmi_pack_request(u8 bus, u16 addr, int size, char read_write,
 	return fn;
 }
 
-#ifndef AORUS_WMI_KUNIT_TEST
-
-/* Minimum result-buffer length per function code, in bytes. */
+/*
+ * Minimum result-buffer length per function code, in bytes. Pure
+ * function: the WMI core enforces this minimum on the result of every
+ * invocation, and the transport seam passes it along.
+ */
 static size_t aorus_wmi_min_result_size(int fn)
 {
 	if (fn == AORUS_WMI_QUICK_READ || fn == AORUS_WMI_RECEIVE_BYTE)
 		return 2;
 	return 4;
 }
+
+#ifndef AORUS_WMI_KUNIT_TEST
 
 /*
  * The real WMBB transport: one synchronous WMI method invocation
@@ -271,13 +279,13 @@ static size_t aorus_wmi_min_result_size(int fn)
  * upstream submission.
  */
 #if KERNEL_VERSION(7, 2, 0) <= LINUX_VERSION_CODE
-static int aorus_wmi_exec(struct aorus_wmi_data *priv, int fn, const u8 *in,
-			  size_t in_len, struct wmi_buffer *result)
+static int aorus_wmi_exec(struct aorus_wmi_data *priv, int fn, size_t min_size,
+			  const u8 *in, size_t in_len, struct wmi_buffer *result)
 {
 	const struct wmi_buffer in_buf = { .length = in_len, .data = (void *)in };
 
 	return wmidev_invoke_method(priv->wdev, 0, fn, &in_buf, result,
-				    aorus_wmi_min_result_size(fn));
+				    min_size);
 }
 #else /* pre-7.2: emulate the invoke_method() contract over evaluate_method() */
 static int aorus_wmi_exec(struct aorus_wmi_data *priv, int fn, const u8 *in,
@@ -321,15 +329,25 @@ static int aorus_wmi_exec(struct aorus_wmi_data *priv, int fn, const u8 *in,
  * Parse a WMBB result buffer into Linux SMBus convention. Pure function:
  * no allocation, no I/O, and safe for every input - returned block
  * lengths are clamped both to I2C_SMBUS_BLOCK_MAX and to the actual
- * length of the result buffer. The WMI core guarantees the result
- * buffer to hold at least the per-function minimum (see
- * aorus_wmi_min_result_size()), so no additional length checks are
- * needed here.
+ * length of the result buffer. The WMI core guarantees the result to
+ * hold at least the per-function minimum (see
+ * aorus_wmi_min_result_size()); the length check below is defense in
+ * depth so the parser stays safe for any transport implementation.
  */
 static s32 aorus_wmi_parse_result(int size, char read_write,
 				  const struct wmi_buffer *result,
 				  union i2c_smbus_data *data)
 {
+	size_t min_len = size == I2C_SMBUS_QUICK || size == I2C_SMBUS_BYTE ?
+			 2 : 4;
+
+	/*
+	 * The WMI core guarantees this minimum in production; the check is
+	 * defense in depth so the parser stays safe for any transport.
+	 */
+	if (result->length < min_len)
+		return -EIO;
+
 	if (read_write == I2C_SMBUS_WRITE) {
 		/* Write transactions report success as a dword 1. */
 		return get_unaligned_le32(result->data) == AORUS_WMI_WRITE_OK ?
@@ -380,6 +398,7 @@ static s32 aorus_wmi_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 	u8 buf[AORUS_WMI_BUF_MAX];
 	size_t in_len;
 	unsigned long start;
+	size_t min_size;
 	int fn, ret;
 
 	a = container_of(adap, struct aorus_wmi_adapter, adap);
@@ -390,10 +409,12 @@ static s32 aorus_wmi_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 	if (fn < 0)
 		return fn;
 
+	min_size = aorus_wmi_min_result_size(fn);
+
 	guard(mutex)(&priv->lock);
 
 	start = jiffies;
-	ret = priv->exec(priv, fn, buf, in_len, &result);
+	ret = priv->exec(priv, fn, min_size, buf, in_len, &result);
 
 	/*
 	 * The WMI core reports a missing result as -ENOMSG and a result
@@ -557,7 +578,12 @@ static int aorus_wmi_probe(struct wmi_device *wdev, const void *context)
 	if (ret)
 		return ret;
 
-	/* Instantiate SPD EEPROM and memory temperature sensor clients. */
+	/*
+	 * Instantiate SPD EEPROM and memory temperature sensor clients.
+	 * The write_enable name is DDR5-centric (SPD5118 write protection);
+	 * for DDR4/ee1004 the enable/disable distinction is a no-op - only
+	 * the read-only client instantiation matters here.
+	 */
 	i2c_register_spd_write_enable(&priv->bus0.adap);
 
 	return aorus_wmi_add_adapter(priv, &priv->bus1, 1,

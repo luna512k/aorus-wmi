@@ -35,6 +35,7 @@ static struct {
 	size_t next_len;
 	int calls;			/* number of exec invocations */
 	int last_fn;
+	size_t last_min_size;
 	size_t last_len;
 	u8 last_buf[AORUS_WMI_BUF_MAX];
 } fake;
@@ -45,17 +46,35 @@ struct aorus_wmi_test_env {
 	struct aorus_wmi_adapter ad1;
 };
 
-static int fake_exec(struct aorus_wmi_data *priv, int fn, const u8 *in,
-		     size_t in_len, struct wmi_buffer *result)
+/*
+ * Simulate the wmidev_invoke_method() contract: a result shorter than
+ * the requested minimum is rejected with -ENODATA, a missing result
+ * with -ENOMSG (normalized to -EIO by smbus_xfer). Ownership of the
+ * queued buffer transfers to smbus_xfer(), which frees it.
+ */
+static int fake_exec(struct aorus_wmi_data *priv, int fn, size_t min_size,
+		     const u8 *in, size_t in_len, struct wmi_buffer *result)
 {
 	fake.calls++;
 	fake.last_fn = fn;
+	fake.last_min_size = min_size;
 	fake.last_len = in_len;
 	if (in_len <= sizeof(fake.last_buf))
 		memcpy(fake.last_buf, in, in_len);
 
 	if (fake.fail)
 		return fake.fail;
+
+	if (!fake.next_data) {
+		if (min_size != 0)
+			return -ENOMSG;
+		result->length = 0;
+		result->data = NULL;
+		return 0;
+	}
+
+	if (fake.next_len < min_size)
+		return -ENODATA;
 
 	result->length = fake.next_len;
 	result->data = fake.next_data;
@@ -634,6 +653,153 @@ static void aorus_wmi_test_exit(struct kunit *test)
 	memset(&fake, 0, sizeof(fake));
 }
 
+/* ---- T1–T6 additions (§17.7/§17.8) -------------------------------------- */
+
+/* T1: functionality() is the capability contract of both adapters. */
+static void aorus_wmi_functionality_matrix(struct kunit *test)
+{
+	struct aorus_wmi_test_env *env = env_init(test, AORUS_WMI_BUS0);
+	u32 f0 = aorus_wmi_functionality(&env->ad0.adap);
+	u32 f1 = aorus_wmi_functionality(&env->ad1.adap);
+
+	KUNIT_EXPECT_TRUE(test,
+			  f0 & I2C_FUNC_SMBUS_QUICK);
+	KUNIT_EXPECT_TRUE(test,
+			  f0 & I2C_FUNC_SMBUS_BYTE);
+	KUNIT_EXPECT_TRUE(test,
+			  f0 & I2C_FUNC_SMBUS_BYTE_DATA);
+	KUNIT_EXPECT_TRUE(test,
+			  f0 & I2C_FUNC_SMBUS_WORD_DATA);
+	KUNIT_EXPECT_TRUE(test,
+			  f0 & I2C_FUNC_SMBUS_BLOCK_DATA);
+
+	KUNIT_EXPECT_FALSE(test,
+			   f1 & I2C_FUNC_SMBUS_QUICK);
+	KUNIT_EXPECT_FALSE(test,
+			   f1 & I2C_FUNC_SMBUS_BYTE);
+	KUNIT_EXPECT_TRUE(test,
+			  f1 & I2C_FUNC_SMBUS_BYTE_DATA);
+	KUNIT_EXPECT_TRUE(test,
+			  f1 & I2C_FUNC_SMBUS_WORD_DATA);
+	KUNIT_EXPECT_TRUE(test,
+			  f1 & I2C_FUNC_SMBUS_BLOCK_DATA);
+
+	/* No PEC controls in the decompiled AML: absent on both buses. */
+	KUNIT_EXPECT_FALSE(test, f0 & I2C_FUNC_SMBUS_PEC);
+	KUNIT_EXPECT_FALSE(test, f1 & I2C_FUNC_SMBUS_PEC);
+}
+
+/* T2: count word > 0 with only the 4-byte header present clamps to 0. */
+static void aorus_wmi_parse_block_clamp_to_zero(struct kunit *test)
+{
+	union i2c_smbus_data data;
+	const u8 hdr[] = { 0x00, 0x00, 0x05, 0x00 };
+	struct wmi_buffer result = { .length = sizeof(hdr),
+				     .data = (u8 *)hdr };
+	int ret;
+
+	ret = aorus_wmi_parse_result(I2C_SMBUS_BLOCK_DATA, I2C_SMBUS_READ,
+				     &result, &data);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, data.block[0], 0);
+}
+
+/* T3: a buffer shorter than the 4-byte status header is rejected. */
+static void aorus_wmi_parse_block_short_header(struct kunit *test)
+{
+	union i2c_smbus_data data;
+	const u8 three[] = { 0x00, 0x00, 0x03 };
+	struct wmi_buffer result = { .length = sizeof(three),
+				     .data = (u8 *)three };
+	int ret;
+
+	ret = aorus_wmi_parse_result(I2C_SMBUS_BLOCK_DATA, I2C_SMBUS_READ,
+				     &result, &data);
+	KUNIT_EXPECT_EQ(test, ret, -EIO);
+}
+
+/* T4: only the exact 0xffff sentinel means NAK - 0x0001ffff is data 0xff. */
+static void aorus_wmi_parse_byte_read_truncation(struct kunit *test)
+{
+	union i2c_smbus_data data;
+	const u8 val[] = { 0xff, 0xff, 0x01, 0x00 };
+	struct wmi_buffer result = { .length = sizeof(val),
+				     .data = (u8 *)val };
+	int ret;
+
+	ret = aorus_wmi_parse_result(I2C_SMBUS_BYTE_DATA, I2C_SMBUS_READ,
+				     &result, &data);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, data.byte, 0xff);
+}
+
+/* T5: word operations send exactly the 7-byte minimum buffer. */
+static void aorus_wmi_pack_word_in_len(struct kunit *test)
+{
+	u8 buf[AORUS_WMI_BUF_MAX];
+	size_t in_len;
+	union i2c_smbus_data data = { .word = 0x2080 };
+	int fn;
+
+	fn = aorus_wmi_pack_request(AORUS_WMI_BUS0, 0x71, I2C_SMBUS_WORD_DATA,
+				    I2C_SMBUS_WRITE, 0x00, &data,
+				    buf, &in_len);
+	KUNIT_EXPECT_EQ(test, fn, AORUS_WMI_WORD_WRITE);
+	KUNIT_EXPECT_EQ(test, in_len, AORUS_WMI_BUF_MIN);
+
+	fn = aorus_wmi_pack_request(AORUS_WMI_BUS0, 0x71, I2C_SMBUS_WORD_DATA,
+				    I2C_SMBUS_READ, 0x00, &data,
+				    buf, &in_len);
+	KUNIT_EXPECT_EQ(test, fn, AORUS_WMI_WORD_READ);
+	KUNIT_EXPECT_EQ(test, in_len, AORUS_WMI_BUF_MIN);
+}
+
+/*
+ * T6: the transport seam must pass the per-function minimum to the WMI
+ * core, and the fake must enforce the invoke_method() contract (short
+ * result -> -ENODATA, missing result -> -ENOMSG, both normalized to
+ * -EIO by smbus_xfer). Without this pin, disabling
+ * aorus_wmi_min_result_size() would go unnoticed (mutation probe C).
+ */
+static void aorus_wmi_min_size_contract(struct kunit *test)
+{
+	struct aorus_wmi_test_env *env = env_init(test, AORUS_WMI_BUS0);
+	union i2c_smbus_data data;
+	int ret;
+
+	/* Byte-data read: minimum is 4 bytes. */
+	fake_set_result(test, (const u8[]){ 0x23, 0x00, 0x00, 0x00 }, 4);
+	ret = aorus_wmi_smbus_xfer(&env->ad0.adap, 0x50, 0, I2C_SMBUS_READ,
+				   0x00, I2C_SMBUS_BYTE_DATA, &data);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, fake.last_min_size, 4);
+
+	/* Quick read: minimum is 2 bytes; a 2-byte result is accepted. */
+	fake_set_result(test, (const u8[]){ 0x34, 0x12 }, 2);
+	ret = aorus_wmi_smbus_xfer(&env->ad0.adap, 0x71, 0, I2C_SMBUS_READ,
+				   0, I2C_SMBUS_QUICK, &data);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, fake.last_min_size, 2);
+
+	/* Byte-data read with a too-short result: core rejects (-ENODATA). */
+	fake_set_result(test, (const u8[]){ 0x23, 0x00 }, 2);
+	ret = aorus_wmi_smbus_xfer(&env->ad0.adap, 0x50, 0, I2C_SMBUS_READ,
+				   0x00, I2C_SMBUS_BYTE_DATA, &data);
+	KUNIT_EXPECT_EQ(test, ret, -EIO);
+
+	/* Missing result: core reports -ENOMSG; normalized to -EIO. */
+	ret = aorus_wmi_smbus_xfer(&env->ad0.adap, 0x50, 0, I2C_SMBUS_READ,
+				   0x00, I2C_SMBUS_BYTE_DATA, &data);
+	KUNIT_EXPECT_EQ(test, ret, -EIO);
+
+	/* The adapter remains usable after the contract rejections. */
+	fake_set_result(test, (const u8[]){ 0x23, 0x00, 0x00, 0x00 }, 4);
+	ret = aorus_wmi_smbus_xfer(&env->ad0.adap, 0x50, 0, I2C_SMBUS_READ,
+				   0x00, I2C_SMBUS_BYTE_DATA, &data);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, data.byte, 0x23);
+}
+
 static struct kunit_case aorus_wmi_test_cases[] = {
 	KUNIT_CASE(aorus_wmi_pack_byte_data_write),
 	KUNIT_CASE(aorus_wmi_pack_byte_data_read),
@@ -657,6 +823,12 @@ static struct kunit_case aorus_wmi_test_cases[] = {
 	KUNIT_CASE(aorus_wmi_xfer_bus1_matrix),
 	KUNIT_CASE(aorus_wmi_xfer_unknown_size),
 	KUNIT_CASE(aorus_wmi_fault_wmi_failure),
+	KUNIT_CASE(aorus_wmi_functionality_matrix),
+	KUNIT_CASE(aorus_wmi_parse_block_clamp_to_zero),
+	KUNIT_CASE(aorus_wmi_parse_block_short_header),
+	KUNIT_CASE(aorus_wmi_parse_byte_read_truncation),
+	KUNIT_CASE(aorus_wmi_pack_word_in_len),
+	KUNIT_CASE(aorus_wmi_min_size_contract),
 	{ }
 };
 

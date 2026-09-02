@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
 CONFIG_KUNIT=y
 CONFIG_I2C=y
 CONFIG_I2C_CHARDEV=y
